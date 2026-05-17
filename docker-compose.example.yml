@@ -1,0 +1,16 @@
+services:
+  wican-bridge:
+    build: .
+    container_name: wican-bridge
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/data
+    depends_on:
+      - mosquitto
+
+  # Reference services (use your existing stack):
+  # mosquitto:
+  #   image: eclipse-mosquitto:2
+  #   ports: ["1883:1883"]
+  #   volumes: ["./mosquitto:/mosquitto/config"]

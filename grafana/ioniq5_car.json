@@ -1,0 +1,468 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "uid": "ioniq5-car-v1",
+  "title": "Ioniq 5 (ST71GRZ)",
+  "tags": ["car", "ioniq5"],
+  "timezone": "browser",
+  "refresh": "1m",
+  "schemaVersion": 39,
+  "time": {"from": "now-7d", "to": "now"},
+  "templating": {"list": []},
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "State of Charge",
+      "datasource": {"type": "influxdb", "uid": "influxdb-energy"},
+      "gridPos": {"h": 6, "w": 6, "x": 0, "y": 0},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "min": 0,
+          "max": 100,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "orange", "value": 20},
+              {"color": "yellow", "value": 40},
+              {"color": "green", "value": 60}
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}
+      },
+      "targets": [{
+        "refId": "A",
+        "query": "from(bucket: \"energy\")\n  |> range(start: -7d)\n  |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"soc_pct\")\n  |> aggregateWindow(every: 10m, fn: last, createEmpty: false)\n  |> keep(columns: [\"_time\", \"_value\"])"
+      }]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "HV kWh Remaining",
+      "datasource": {"type": "influxdb", "uid": "influxdb-energy"},
+      "gridPos": {"h": 6, "w": 6, "x": 6, "y": 0},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "kwatth",
+          "decimals": 1,
+          "min": 0,
+          "max": 67,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "orange", "value": 15},
+              {"color": "yellow", "value": 30},
+              {"color": "green", "value": 45}
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "reduceOptions": {"calcs": ["lastNotNull"]}
+      },
+      "targets": [{
+        "refId": "A",
+        "query": "from(bucket: \"energy\")\n  |> range(start: -7d)\n  |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"hv_kwh_remaining\")\n  |> last()"
+      }]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Battery Health (SoH)",
+      "datasource": {"type": "influxdb", "uid": "influxdb-energy"},
+      "gridPos": {"h": 6, "w": 6, "x": 12, "y": 0},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "min": 70,
+          "max": 100,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "orange", "value": 80},
+              {"color": "yellow", "value": 90},
+              {"color": "green", "value": 95}
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "reduceOptions": {"calcs": ["lastNotNull"]}
+      },
+      "targets": [{
+        "refId": "A",
+        "query": "from(bucket: \"energy\")\n  |> range(start: -30d)\n  |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"soh_pct\")\n  |> last()"
+      }]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "12V Battery",
+      "description": "Aux battery voltage. Sustained <12.4V = aging; <12.0V = imminent failure (#1 Ioniq 5 reliability issue)",
+      "datasource": {"type": "influxdb", "uid": "influxdb-energy"},
+      "gridPos": {"h": 6, "w": 6, "x": 18, "y": 0},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "volt",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "orange", "value": 12.0},
+              {"color": "yellow", "value": 12.4},
+              {"color": "green", "value": 12.8}
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "reduceOptions": {"calcs": ["lastNotNull"]}
+      },
+      "targets": [{
+        "refId": "A",
+        "query": "from(bucket: \"energy\")\n  |> range(start: -7d)\n  |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"12v_battery_v\")\n  |> aggregateWindow(every: 30m, fn: last, createEmpty: false)\n  |> keep(columns: [\"_time\", \"_value\"])"
+      }]
+    },
+    {
+      "id": 10,
+      "type": "stat",
+      "title": "Charging",
+      "datasource": {"type": "influxdb", "uid": "influxdb-energy"},
+      "gridPos": {"h": 3, "w": 4, "x": 0, "y": 6},
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {"type": "value", "options": {"0": {"text": "No", "color": "text"}, "1": {"text": "Yes", "color": "green"}}}
+          ],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "text", "value": null}]}
+        }
+      },
+      "options": {"colorMode": "value", "graphMode": "none", "reduceOptions": {"calcs": ["lastNotNull"]}},
+      "targets": [{"refId": "A", "query": "from(bucket: \"energy\") |> range(start: -1h) |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"charging\") |> last()"}]
+    },
+    {
+      "id": 11,
+      "type": "stat",
+      "title": "AC Plug",
+      "datasource": {"type": "influxdb", "uid": "influxdb-energy"},
+      "gridPos": {"h": 3, "w": 4, "x": 4, "y": 6},
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {"type": "value", "options": {"0": {"text": "Unplugged", "color": "text"}, "1": {"text": "Plugged in", "color": "blue"}}}
+          ],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "text", "value": null}]}
+        }
+      },
+      "options": {"colorMode": "value", "reduceOptions": {"calcs": ["lastNotNull"]}},
+      "targets": [{"refId": "A", "query": "from(bucket: \"energy\") |> range(start: -1h) |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"ac_plug\") |> last()"}]
+    },
+    {
+      "id": 12,
+      "type": "stat",
+      "title": "Driving (READY)",
+      "datasource": {"type": "influxdb", "uid": "influxdb-energy"},
+      "gridPos": {"h": 3, "w": 4, "x": 8, "y": 6},
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {"type": "value", "options": {"0": {"text": "Parked", "color": "text"}, "1": {"text": "Driving", "color": "purple"}}}
+          ],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "text", "value": null}]}
+        }
+      },
+      "options": {"colorMode": "value", "reduceOptions": {"calcs": ["lastNotNull"]}},
+      "targets": [{"refId": "A", "query": "from(bucket: \"energy\") |> range(start: -1h) |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"journey_in_progress\") |> last()"}]
+    },
+    {
+      "id": 13,
+      "type": "stat",
+      "title": "Last seen",
+      "description": "Time since last successful poll. If >20 min the car is asleep/away.",
+      "datasource": {"type": "influxdb", "uid": "influxdb-energy"},
+      "gridPos": {"h": 3, "w": 12, "x": 12, "y": 6},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "dateTimeFromNow",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 1200},
+              {"color": "red", "value": 3600}
+            ]
+          }
+        }
+      },
+      "options": {"colorMode": "value", "reduceOptions": {"calcs": ["lastNotNull"]}, "textMode": "value"},
+      "targets": [{
+        "refId": "A",
+        "query": "from(bucket: \"energy\")\n  |> range(start: -1d)\n  |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"last_seen\")\n  |> last()\n  |> map(fn: (r) => ({ r with _value: int(v: r._value) * 1000 }))"
+      }]
+    },
+    {
+      "id": 14,
+      "type": "stat",
+      "title": "Battery Temp Range",
+      "datasource": {"type": "influxdb", "uid": "influxdb-energy"},
+      "gridPos": {"h": 3, "w": 4, "x": 0, "y": 9},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "celsius",
+          "decimals": 0,
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color": "blue", "value": null},
+            {"color": "green", "value": 5},
+            {"color": "yellow", "value": 35},
+            {"color": "red", "value": 45}
+          ]}
+        }
+      },
+      "options": {"colorMode": "value", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "/.*/"}, "orientation": "horizontal", "textMode": "value_and_name"},
+      "targets": [
+        {"refId": "A", "query": "from(bucket: \"energy\") |> range(start: -1h) |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"hv_t_min\") |> last() |> set(key: \"_field\", value: \"min\")"},
+        {"refId": "B", "query": "from(bucket: \"energy\") |> range(start: -1h) |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"hv_t_max\") |> last() |> set(key: \"_field\", value: \"max\")"}
+      ]
+    },
+    {
+      "id": 15,
+      "type": "stat",
+      "title": "Cell Voltage Spread",
+      "description": "Difference between strongest and weakest cell. >100 mV = aging cell, investigate. New pack typically <20 mV.",
+      "datasource": {"type": "influxdb", "uid": "influxdb-energy"},
+      "gridPos": {"h": 3, "w": 4, "x": 4, "y": 9},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color": "green", "value": null},
+            {"color": "yellow", "value": 50},
+            {"color": "red", "value": 100}
+          ]}
+        }
+      },
+      "options": {"colorMode": "background", "reduceOptions": {"calcs": ["lastNotNull"]}},
+      "targets": [{"refId": "A", "query": "from(bucket: \"energy\") |> range(start: -1h) |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"hv_cell_v_diff_mv\") |> last()"}]
+    },
+    {
+      "id": 16,
+      "type": "bargauge",
+      "title": "Tyre Pressures (psi)",
+      "description": "Recommended ~36 psi cold. <30 = warning, <26 = critical.",
+      "datasource": {"type": "influxdb", "uid": "influxdb-energy"},
+      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 9},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pressurepsi",
+          "decimals": 1,
+          "min": 20,
+          "max": 45,
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color": "red", "value": null},
+            {"color": "orange", "value": 28},
+            {"color": "yellow", "value": 32},
+            {"color": "green", "value": 34}
+          ]}
+        }
+      },
+      "options": {"orientation": "horizontal", "displayMode": "gradient", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "/.*/"}, "showUnfilled": true},
+      "targets": [
+        {"refId": "A", "query": "from(bucket: \"energy\") |> range(start: -2h) |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"tyre_p_fl_psi\") |> last() |> set(key: \"_field\", value: \"Front L\")"},
+        {"refId": "B", "query": "from(bucket: \"energy\") |> range(start: -2h) |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"tyre_p_fr_psi\") |> last() |> set(key: \"_field\", value: \"Front R\")"},
+        {"refId": "C", "query": "from(bucket: \"energy\") |> range(start: -2h) |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"tyre_p_rl_psi\") |> last() |> set(key: \"_field\", value: \"Rear L\")"},
+        {"refId": "D", "query": "from(bucket: \"energy\") |> range(start: -2h) |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"tyre_p_rr_psi\") |> last() |> set(key: \"_field\", value: \"Rear R\")"}
+      ]
+    },
+    {
+      "id": 17,
+      "type": "stat",
+      "title": "HV Pack",
+      "description": "Pack V/A/W only meaningful when contactors closed (driving or charging)",
+      "datasource": {"type": "influxdb", "uid": "influxdb-energy"},
+      "gridPos": {"h": 6, "w": 8, "x": 16, "y": 9},
+      "fieldConfig": {
+        "defaults": {"decimals": 1, "thresholds": {"mode": "absolute", "steps": [{"color": "text", "value": null}]}},
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "Voltage"}, "properties": [{"id": "unit", "value": "volt"}]},
+          {"matcher": {"id": "byName", "options": "Current"}, "properties": [{"id": "unit", "value": "amp"}]},
+          {"matcher": {"id": "byName", "options": "Power"}, "properties": [{"id": "unit", "value": "watt"}]}
+        ]
+      },
+      "options": {"colorMode": "value", "graphMode": "none", "orientation": "vertical", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "/.*/"}, "textMode": "value_and_name"},
+      "targets": [
+        {"refId": "A", "query": "from(bucket: \"energy\") |> range(start: -10m) |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"hv_pack_v\") |> last() |> set(key: \"_field\", value: \"Voltage\")"},
+        {"refId": "B", "query": "from(bucket: \"energy\") |> range(start: -10m) |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"hv_pack_a\") |> last() |> set(key: \"_field\", value: \"Current\")"},
+        {"refId": "C", "query": "from(bucket: \"energy\") |> range(start: -10m) |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"hv_pack_w\") |> last() |> set(key: \"_field\", value: \"Power\")"}
+      ]
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "State of Charge (7d)",
+      "datasource": {"type": "influxdb", "uid": "influxdb-energy"},
+      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 15},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "custom": {"drawStyle": "line", "lineInterpolation": "stepBefore", "lineWidth": 2, "fillOpacity": 20, "pointSize": 4}
+        }
+      },
+      "options": {"legend": {"showLegend": false}, "tooltip": {"mode": "single"}},
+      "targets": [{"refId": "A", "query": "from(bucket: \"energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"soc_pct\") |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)"}]
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "12V Battery (7d) — health canary",
+      "description": "Watch for the daily resting voltage dropping over weeks. Drops below 12.4V when idle = battery aging.",
+      "datasource": {"type": "influxdb", "uid": "influxdb-energy"},
+      "gridPos": {"h": 7, "w": 12, "x": 12, "y": 15},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "volt",
+          "decimals": 2,
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 15}
+        }
+      },
+      "options": {"legend": {"showLegend": false}, "tooltip": {"mode": "single"}},
+      "targets": [{"refId": "A", "query": "from(bucket: \"energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"12v_battery_v\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"}]
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Lifetime Energy Charged vs Discharged",
+      "datasource": {"type": "influxdb", "uid": "influxdb-energy"},
+      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 22},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "kwatth",
+          "decimals": 1,
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}
+        }
+      },
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"refId": "A", "query": "from(bucket: \"energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"cumulative_charge_kwh\") |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false) |> set(key: \"_field\", value: \"Charged\")"},
+        {"refId": "B", "query": "from(bucket: \"energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"cumulative_discharge_kwh\") |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false) |> set(key: \"_field\", value: \"Discharged\")"}
+      ]
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Battery Temperature (7d)",
+      "datasource": {"type": "influxdb", "uid": "influxdb-energy"},
+      "gridPos": {"h": 7, "w": 12, "x": 12, "y": 22},
+      "fieldConfig": {
+        "defaults": {"unit": "celsius", "decimals": 0, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}}
+      },
+      "options": {"legend": {"displayMode": "list", "showLegend": true}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"refId": "A", "query": "from(bucket: \"energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"hv_t_max\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false) |> set(key: \"_field\", value: \"Max\")"},
+        {"refId": "B", "query": "from(bucket: \"energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"hv_t_min\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false) |> set(key: \"_field\", value: \"Min\")"}
+      ]
+    },
+    {
+      "id": 30,
+      "type": "stat",
+      "title": "Last Journey",
+      "datasource": {"type": "influxdb", "uid": "influxdb-energy"},
+      "gridPos": {"h": 5, "w": 12, "x": 0, "y": 29},
+      "fieldConfig": {
+        "defaults": {"thresholds": {"mode": "absolute", "steps": [{"color": "text", "value": null}]}},
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "Duration"}, "properties": [{"id": "unit", "value": "m"}, {"id": "decimals", "value": 1}]},
+          {"matcher": {"id": "byName", "options": "kWh used"}, "properties": [{"id": "unit", "value": "kwatth"}, {"id": "decimals", "value": 2}]},
+          {"matcher": {"id": "byName", "options": "kWh regen"}, "properties": [{"id": "unit", "value": "kwatth"}, {"id": "decimals", "value": 2}, {"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}]},
+          {"matcher": {"id": "byName", "options": "SoC Δ"}, "properties": [{"id": "unit", "value": "percent"}, {"id": "decimals", "value": 1}]},
+          {"matcher": {"id": "byName", "options": "Miles"}, "properties": [{"id": "unit", "value": "lengthmi"}, {"id": "decimals", "value": 1}]},
+          {"matcher": {"id": "byName", "options": "mi/kWh"}, "properties": [{"id": "decimals", "value": 2}, {"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]}
+        ]
+      },
+      "options": {"colorMode": "value", "graphMode": "none", "orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "/.*/"}, "textMode": "value_and_name"},
+      "targets": [
+        {"refId": "A", "query": "from(bucket: \"energy\") |> range(start: -30d) |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"journey_last_duration_min\") |> last() |> set(key: \"_field\", value: \"Duration\")"},
+        {"refId": "B", "query": "from(bucket: \"energy\") |> range(start: -30d) |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"journey_last_kwh_used\") |> last() |> set(key: \"_field\", value: \"kWh used\")"},
+        {"refId": "C", "query": "from(bucket: \"energy\") |> range(start: -30d) |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"journey_last_kwh_regen\") |> last() |> set(key: \"_field\", value: \"kWh regen\")"},
+        {"refId": "D", "query": "from(bucket: \"energy\") |> range(start: -30d) |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"journey_last_soc_delta\") |> last() |> set(key: \"_field\", value: \"SoC Δ\")"},
+        {"refId": "E", "query": "from(bucket: \"energy\") |> range(start: -30d) |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"journey_last_miles\") |> last() |> set(key: \"_field\", value: \"Miles\")"},
+        {"refId": "F", "query": "from(bucket: \"energy\") |> range(start: -30d) |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"journey_last_mi_per_kwh\") |> last() |> set(key: \"_field\", value: \"mi/kWh\")"}
+      ]
+    },
+    {
+      "id": 32,
+      "type": "stat",
+      "title": "Odometer",
+      "datasource": {"type": "influxdb", "uid": "influxdb-energy"},
+      "gridPos": {"h": 3, "w": 6, "x": 0, "y": 12},
+      "fieldConfig": {"defaults": {"unit": "lengthmi", "decimals": 0, "color": {"mode": "fixed", "fixedColor": "text"}}},
+      "options": {"colorMode": "value", "graphMode": "none", "reduceOptions": {"calcs": ["lastNotNull"], "fields": ""}, "textMode": "value"},
+      "targets": [
+        {"refId": "A", "query": "from(bucket: \"energy\") |> range(start: -90d) |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"odometer_mi\") |> last()"}
+      ]
+    },
+    {
+      "id": 33,
+      "type": "stat",
+      "title": "Lifetime mi/kWh (rolling)",
+      "datasource": {"type": "influxdb", "uid": "influxdb-energy"},
+      "gridPos": {"h": 3, "w": 6, "x": 6, "y": 12},
+      "fieldConfig": {"defaults": {"decimals": 2, "color": {"mode": "fixed", "fixedColor": "blue"}}},
+      "options": {"colorMode": "value", "graphMode": "none", "reduceOptions": {"calcs": ["mean"], "fields": ""}, "textMode": "value"},
+      "targets": [
+        {"refId": "A", "query": "from(bucket: \"energy\") |> range(start: -90d) |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"journey_last_mi_per_kwh\") |> mean()"}
+      ]
+    },
+    {
+      "id": 31,
+      "type": "stat",
+      "title": "Last Charge",
+      "datasource": {"type": "influxdb", "uid": "influxdb-energy"},
+      "gridPos": {"h": 5, "w": 12, "x": 12, "y": 29},
+      "fieldConfig": {
+        "defaults": {"thresholds": {"mode": "absolute", "steps": [{"color": "text", "value": null}]}},
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "Duration"}, "properties": [{"id": "unit", "value": "m"}, {"id": "decimals", "value": 1}]},
+          {"matcher": {"id": "byName", "options": "kWh added"}, "properties": [{"id": "unit", "value": "kwatth"}, {"id": "decimals", "value": 2}, {"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}]},
+          {"matcher": {"id": "byName", "options": "Avg kW"}, "properties": [{"id": "unit", "value": "kwatt"}, {"id": "decimals", "value": 2}]},
+          {"matcher": {"id": "byName", "options": "SoC gained"}, "properties": [{"id": "unit", "value": "percent"}, {"id": "decimals", "value": 1}]}
+        ]
+      },
+      "options": {"colorMode": "value", "graphMode": "none", "orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "/.*/"}, "textMode": "value_and_name"},
+      "targets": [
+        {"refId": "A", "query": "from(bucket: \"energy\") |> range(start: -30d) |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"charge_last_duration_min\") |> last() |> set(key: \"_field\", value: \"Duration\")"},
+        {"refId": "B", "query": "from(bucket: \"energy\") |> range(start: -30d) |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"charge_last_kwh_added\") |> last() |> set(key: \"_field\", value: \"kWh added\")"},
+        {"refId": "C", "query": "from(bucket: \"energy\") |> range(start: -30d) |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"charge_last_avg_kw\") |> last() |> set(key: \"_field\", value: \"Avg kW\")"},
+        {"refId": "D", "query": "from(bucket: \"energy\") |> range(start: -30d) |> filter(fn: (r) => r._measurement == \"ioniq5\" and r._field == \"charge_last_soc_added\") |> last() |> set(key: \"_field\", value: \"SoC gained\")"}
+      ]
+    }
+  ]
+}
