@@ -285,6 +285,36 @@ def decode_pid5b_soc(data: bytes):
     return round(data[2] * 100.0 / 255.0, 1)
 
 
+def decode_pid46_ambient(data: bytes):
+    """Mode 01 PID 46: ambient air temperature, A - 40 = °C."""
+    if len(data) < 3 or data[0] != 0x41 or data[1] != 0x46:
+        return None
+    return data[2] - 40
+
+
+def decode_pid0d_speed(data: bytes):
+    """Mode 01 PID 0D: vehicle speed, A = km/h."""
+    if len(data) < 3 or data[0] != 0x41 or data[1] != 0x0D:
+        return None
+    return data[2]
+
+
+def decode_vmcu_dte(resp: bytes, valid: set):
+    """VMCU PID 0101 predicted range / DTE.
+
+    Community-reported offset for E-GMP is u16 at bytes 26-27 (km).
+    NOT bench-verified on ST71GRZ — see logged raw bytes and recalibrate
+    against the dashboard's "miles remaining" reading."""
+    if len(resp) < 3 or resp[0] != 0x62 or resp[1] != 0x01 or resp[2] != 0x01:
+        return None
+    if not all((26 + i) in valid for i in range(2)):
+        return None
+    raw = int.from_bytes(resp[26:28], "big")
+    if raw == 0 or raw > 1000:
+        return None
+    return raw  # km
+
+
 def decode_22_01_05_soh(resp: bytes):
     """BMS extended PID 0105: SOH lives at offset 28-29 (u16/10)."""
     if len(resp) < 30 or resp[0] != 0x62 or resp[1] != 0x01 or resp[2] != 0x05:
@@ -604,6 +634,27 @@ def main():
                     # Most common cause: car parked + unplugged → WiCAN awake but ECU asleep.
                     log.info("PID 5B no response (ECU likely asleep)")
 
+                # 1b) Standard OBD-II Mode 01 PIDs: ambient air temp (PID 46),
+                # vehicle speed (PID 0D). Any 7E8-7EF ECU may answer; use rx_id=0
+                # wildcard. Speed is 0 when parked but the response confirms the
+                # bus is responsive.
+                amb_data = wican.query_single(0x7DF, 0, bytes.fromhex("0146"))
+                if amb_data:
+                    amb = decode_pid46_ambient(amb_data)
+                    if amb is not None:
+                        mq.publish(f"{TOPIC_PREFIX}/ambient_air_c", str(amb), retain=True)
+                        log.info("ambient = %d°C", amb)
+                        published += 1
+
+                speed_data = wican.query_single(0x7DF, 0, bytes.fromhex("010D"))
+                if speed_data:
+                    speed = decode_pid0d_speed(speed_data)
+                    if speed is not None:
+                        mq.publish(f"{TOPIC_PREFIX}/speed_kph", str(speed), retain=True)
+                        if speed > 0:
+                            log.info("speed = %d km/h", speed)
+                        published += 1
+
                 # 2) Cumulative metrics from BMS via Mode 22 PID 0101.
                 resp, total, valid = wican.query_iso_tp_late_cfs(
                     0x7E4, 0x7EC, bytes.fromhex("220101"))
@@ -677,6 +728,25 @@ def main():
                             log.info("odometer: %s", odo)
                     elif odo_resp and odo_resp[0] == 0x7F and len(odo_resp) >= 3:
                         log.debug("odometer NRC=0x%02X", odo_resp[2])
+
+                # 3d) Predicted range (DTE) from VMCU (7E2 -> 7EA) PID 22 0101.
+                # Byte offset for the DTE u16 is community-reported as 26-27
+                # but NOT bench-verified on this car — raw bytes are logged so we
+                # can recalibrate against the dashboard reading. Also handy: the
+                # full VMCU payload contains gear position, motor temps, etc.
+                resp_v, total_v, valid_v = wican.query_iso_tp_late_cfs(
+                    0x7E2, 0x7EA, bytes.fromhex("220101"))
+                if resp_v and len(valid_v) > 6:
+                    log.info("VMCU 0101 raw (%d/%d): %s",
+                             len(valid_v), total_v, resp_v.hex())
+                    dte_km = decode_vmcu_dte(resp_v, valid_v)
+                    if dte_km is not None:
+                        mq.publish(f"{TOPIC_PREFIX}/dte_km", str(dte_km), retain=True)
+                        mq.publish(f"{TOPIC_PREFIX}/dte_mi",
+                                   f"{dte_km * 0.621371:.0f}", retain=True)
+                        log.info("DTE = %d km (%.0f mi) [uncalibrated]",
+                                 dte_km, dte_km * 0.621371)
+                        published += 1
 
                 # 4) 12V battery voltage from WiCAN /check_status (free HTTP call).
                 v12 = get_12v_voltage()
