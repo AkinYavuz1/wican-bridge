@@ -89,6 +89,10 @@ class WiCAN:
     def close(self):
         if self.sock:
             try:
+                self.sock.sendall(b"C\r")  # close slcan channel before dropping TCP
+            except Exception:
+                pass
+            try:
                 self.sock.close()
             except Exception:
                 pass
@@ -602,8 +606,176 @@ def decode_22_01_01_partial(resp_bytes: bytes, valid_offsets: set):
     return out
 
 
+PRESENCE_CHECK_SECONDS = int(os.environ.get("PRESENCE_CHECK_SECONDS", "60"))
+
+
+def wican_reachable():
+    """Return True if WiCAN HTTP endpoint responds (lightweight presence check)."""
+    try:
+        with urllib.request.urlopen(f"http://{WICAN_HOST}/check_status", timeout=3) as r:
+            r.read()
+        return True
+    except Exception:
+        return False
+
+
+def do_poll(wican, state, mq):
+    """Run one complete set of OBD queries and publish. Called once per WiFi visit."""
+    published = 0
+    soc_data = None
+    soc = None
+    resp = None
+    valid = set()
+    metrics = {}
+
+    # 1) Single-frame SoC via Mode 01 PID 5B (BMS at 7EC).
+    soc_data = wican.query_single(0x7DF, 0x7EC, bytes.fromhex("015B"))
+    if soc_data:
+        soc = decode_pid5b_soc(soc_data)
+        if soc is not None:
+            mq.publish(f"{TOPIC_PREFIX}/soc_pct", f"{soc:.1f}", retain=True)
+            log.info("SoC = %.1f%%", soc)
+            published += 1
+    else:
+        # BMS did not respond — ECUs are asleep. Stop here to avoid sending
+        # further CAN frames that would wake additional ECUs and drain the 12V.
+        log.info("PID 5B no response (ECU asleep) — aborting poll to protect 12V battery")
+        return published
+
+    # 1b) Standard OBD-II Mode 01 PIDs: ambient air temp (PID 46), vehicle speed (PID 0D).
+    amb_data = wican.query_single(0x7DF, 0, bytes.fromhex("0146"))
+    if amb_data:
+        amb = decode_pid46_ambient(amb_data)
+        if amb is not None:
+            mq.publish(f"{TOPIC_PREFIX}/ambient_air_c", str(amb), retain=True)
+            log.info("ambient = %d°C", amb)
+            published += 1
+
+    speed_data = wican.query_single(0x7DF, 0, bytes.fromhex("010D"))
+    if speed_data:
+        speed = decode_pid0d_speed(speed_data)
+        if speed is not None:
+            mq.publish(f"{TOPIC_PREFIX}/speed_kph", str(speed), retain=True)
+            if speed > 0:
+                log.info("speed = %d km/h", speed)
+            published += 1
+
+    # 2) Cumulative metrics from BMS via Mode 22 PID 0101.
+    resp, total, valid = wican.query_iso_tp_late_cfs(
+        0x7E4, 0x7EC, bytes.fromhex("220101"))
+    if resp and len(valid) > 6:
+        metrics = decode_22_01_01_partial(resp, valid)
+        for k, v in metrics.items():
+            mq.publish(f"{TOPIC_PREFIX}/{k}", f"{v:.1f}" if isinstance(v, float) else str(v), retain=True)
+            published += 1
+        log.info("cumulative metrics (%d/%d bytes): %s", len(valid), total, metrics)
+
+    # 2b) Live + flag fields from BMS PID 0101.
+    if resp and len(valid) > 6:
+        live = decode_22_01_01_live(resp)
+        for k, v in live.items():
+            mq.publish(f"{TOPIC_PREFIX}/{k}", f"{v:.3f}" if isinstance(v, float) else str(v), retain=True)
+            published += 1
+
+    # 3) Battery health (SOH) + HV_KWH_R from BMS Mode 22 PID 0105.
+    resp5, total5, valid5 = wican.query_iso_tp_late_cfs(
+        0x7E4, 0x7EC, bytes.fromhex("220105"))
+    if resp5 and all(o in valid5 for o in range(28, 30)):
+        soh = decode_22_01_05_soh(resp5)
+        if soh is not None:
+            mq.publish(f"{TOPIC_PREFIX}/soh_pct", f"{soh:.1f}", retain=True)
+            log.info("SOH = %.1f%%", soh)
+            published += 1
+    if resp5 and all(o in valid5 for o in range(31, 33)):
+        extra5 = decode_22_01_05_extra(resp5)
+        for k, v in extra5.items():
+            mq.publish(f"{TOPIC_PREFIX}/{k}", f"{v:.2f}" if isinstance(v, float) else str(v), retain=True)
+            published += 1
+        if extra5:
+            log.info("BMS extended: %s", extra5)
+
+    # 3b) Tyre pressures/temps from TPMS (7A0) PID C00B.
+    resp_t, total_t, valid_t = wican.query_iso_tp_late_cfs(
+        0x7A0, 0x7A8, bytes.fromhex("22C00B"))
+    if resp_t and len(valid_t) >= 30:
+        tyres = decode_22_c0_0b_tpms(resp_t)
+        for k, v in tyres.items():
+            mq.publish(f"{TOPIC_PREFIX}/{k}", str(v), retain=True)
+            published += 1
+        if tyres:
+            log.info("tyres: %s", tyres)
+
+    # 3c) Opportunistic odometer from cluster ECU (7C6, PID 22B002).
+    # Guard: only attempt if ECUs are already awake (published > 0), to avoid
+    # waking the cluster ECU with a UDS DiagnosticSessionControl when everything else is silent.
+    if published > 0 and wican.open_extended_session(0x7C6, 0x7CE):
+        if not state.get("vin"):
+            vin_resp, vin_total, vin_valid = wican.query_iso_tp_late_cfs(
+                0x7C6, 0x7CE, bytes.fromhex("22F190"), timeout=2.0)
+            if vin_resp:
+                vin = decode_vin(vin_resp)
+                if vin:
+                    state["vin"] = vin
+                    mq.publish(f"{TOPIC_PREFIX}/vin", vin, retain=True)
+                    log.info("VIN = %s", vin)
+                    published += 1
+        odo_resp, odo_total, odo_valid = wican.query_iso_tp_late_cfs(
+            0x7C6, 0x7CE, bytes.fromhex("22B002"), timeout=2.0)
+        if odo_resp and odo_resp[0] == 0x62:
+            odo = decode_odometer(odo_resp)
+            if odo:
+                for k, v in odo.items():
+                    mq.publish(f"{TOPIC_PREFIX}/{k}", str(v), retain=True)
+                    published += 1
+                if "odometer_mi" in odo:
+                    state["last_odometer_mi"] = odo["odometer_mi"]
+                log.info("odometer: %s", odo)
+        elif odo_resp and odo_resp[0] == 0x7F and len(odo_resp) >= 3:
+            log.debug("odometer NRC=0x%02X", odo_resp[2])
+
+    # 3d) Predicted range (DTE) from VMCU (7E2 -> 7EA) PID 22 0101.
+    resp_v, total_v, valid_v = wican.query_iso_tp_late_cfs(
+        0x7E2, 0x7EA, bytes.fromhex("220101"))
+    if resp_v and len(valid_v) > 6:
+        log.info("VMCU 0101 raw (%d/%d): %s", len(valid_v), total_v, resp_v.hex())
+        dte_km = decode_vmcu_dte(resp_v, valid_v)
+        if dte_km is not None:
+            mq.publish(f"{TOPIC_PREFIX}/dte_km", str(dte_km), retain=True)
+            mq.publish(f"{TOPIC_PREFIX}/dte_mi",
+                       f"{dte_km * 0.621371:.0f}", retain=True)
+            log.info("DTE = %d km (%.0f mi) [uncalibrated]", dte_km, dte_km * 0.621371)
+            published += 1
+
+    # 4) 12V battery voltage from WiCAN /check_status (free HTTP call).
+    v12 = get_12v_voltage()
+    if v12 is not None:
+        mq.publish(f"{TOPIC_PREFIX}/12v_battery_v", f"{v12:.2f}", retain=True)
+        log.info("12V battery = %.2fV", v12)
+        published += 1
+
+    if published:
+        now_ts = int(time.time())
+        mq.publish(f"{TOPIC_PREFIX}/last_seen", str(now_ts), retain=True)
+        if (soc_data and resp and len(valid) > 6
+                and "operating_time_s" in metrics
+                and "cumulative_discharge_kwh" in metrics
+                and "cumulative_charge_kwh" in metrics):
+            current = {
+                "ts": now_ts,
+                "soc": soc,
+                "op_time_s": metrics["operating_time_s"],
+                "discharge_kwh": metrics["cumulative_discharge_kwh"],
+                "charge_kwh": metrics["cumulative_charge_kwh"],
+                "odometer_mi": state.get("last_odometer_mi"),
+            }
+            update_session_state(state, current, mq)
+            save_state(state)
+
+    return published
+
+
 def main():
-    log.info("wican-bridge starting (poll every %ds)", POLL_SECONDS)
+    log.info("wican-bridge starting (presence-triggered, check every %ds)", PRESENCE_CHECK_SECONDS)
     mq = mqtt.Client(client_id="wican-bridge", protocol=mqtt.MQTTv311)
     mq.username_pw_set(MQTT_USER, MQTT_PASSWORD)
     mq.will_set(f"{TOPIC_PREFIX}/online", "0", retain=True)
@@ -612,176 +784,42 @@ def main():
     mq.publish(f"{TOPIC_PREFIX}/online", "1", retain=True)
 
     state = load_state()
-    backoff = 5
+    # True while WiCAN is in range and we have already polled this visit.
+    # Resets to False when WiCAN leaves WiFi range.
+    polled_this_visit = False
+
     while True:
+        present = wican_reachable()
+
+        if not present:
+            if polled_this_visit:
+                log.info("WiCAN left WiFi range — will poll on next appearance")
+                polled_this_visit = False
+            time.sleep(PRESENCE_CHECK_SECONDS)
+            continue
+
+        if polled_this_visit:
+            # Still in range, already polled — just keep checking presence.
+            time.sleep(PRESENCE_CHECK_SECONDS)
+            continue
+
+        # First detection this visit — run one full poll.
+        log.info("WiCAN appeared — running one-shot poll")
         wican = WiCAN(WICAN_HOST, WICAN_PORT)
         try:
             wican.connect()
-            backoff = 5
-            while True:
-                t0 = time.monotonic()
-                published = 0
-
-                # 1) Single-frame SoC via Mode 01 PID 5B (BMS at 7EC).
-                soc_data = wican.query_single(0x7DF, 0x7EC, bytes.fromhex("015B"))
-                if soc_data:
-                    soc = decode_pid5b_soc(soc_data)
-                    if soc is not None:
-                        mq.publish(f"{TOPIC_PREFIX}/soc_pct", f"{soc:.1f}", retain=True)
-                        log.info("SoC = %.1f%%", soc)
-                        published += 1
-                else:
-                    # Most common cause: car parked + unplugged → WiCAN awake but ECU asleep.
-                    log.info("PID 5B no response (ECU likely asleep)")
-
-                # 1b) Standard OBD-II Mode 01 PIDs: ambient air temp (PID 46),
-                # vehicle speed (PID 0D). Any 7E8-7EF ECU may answer; use rx_id=0
-                # wildcard. Speed is 0 when parked but the response confirms the
-                # bus is responsive.
-                amb_data = wican.query_single(0x7DF, 0, bytes.fromhex("0146"))
-                if amb_data:
-                    amb = decode_pid46_ambient(amb_data)
-                    if amb is not None:
-                        mq.publish(f"{TOPIC_PREFIX}/ambient_air_c", str(amb), retain=True)
-                        log.info("ambient = %d°C", amb)
-                        published += 1
-
-                speed_data = wican.query_single(0x7DF, 0, bytes.fromhex("010D"))
-                if speed_data:
-                    speed = decode_pid0d_speed(speed_data)
-                    if speed is not None:
-                        mq.publish(f"{TOPIC_PREFIX}/speed_kph", str(speed), retain=True)
-                        if speed > 0:
-                            log.info("speed = %d km/h", speed)
-                        published += 1
-
-                # 2) Cumulative metrics from BMS via Mode 22 PID 0101.
-                resp, total, valid = wican.query_iso_tp_late_cfs(
-                    0x7E4, 0x7EC, bytes.fromhex("220101"))
-                if resp and len(valid) > 6:
-                    metrics = decode_22_01_01_partial(resp, valid)
-                    for k, v in metrics.items():
-                        mq.publish(f"{TOPIC_PREFIX}/{k}", f"{v:.1f}" if isinstance(v, float) else str(v), retain=True)
-                        published += 1
-                    log.info("cumulative metrics (%d/%d bytes): %s",
-                             len(valid), total, metrics)
-
-                # 2b) Live + flag fields from BMS PID 0101 (charging state, cell V/T spread, pack V/A).
-                if resp and len(valid) > 6:
-                    live = decode_22_01_01_live(resp)
-                    for k, v in live.items():
-                        mq.publish(f"{TOPIC_PREFIX}/{k}", f"{v:.3f}" if isinstance(v, float) else str(v), retain=True)
-                        published += 1
-
-                # 3) Battery health (SOH) + HV_KWH_R from BMS Mode 22 PID 0105.
-                resp5, total5, valid5 = wican.query_iso_tp_late_cfs(
-                    0x7E4, 0x7EC, bytes.fromhex("220105"))
-                if resp5 and all(o in valid5 for o in range(28, 30)):
-                    soh = decode_22_01_05_soh(resp5)
-                    if soh is not None:
-                        mq.publish(f"{TOPIC_PREFIX}/soh_pct", f"{soh:.1f}", retain=True)
-                        log.info("SOH = %.1f%%", soh)
-                        published += 1
-                if resp5 and all(o in valid5 for o in range(31, 33)):
-                    extra5 = decode_22_01_05_extra(resp5)
-                    for k, v in extra5.items():
-                        mq.publish(f"{TOPIC_PREFIX}/{k}", f"{v:.2f}" if isinstance(v, float) else str(v), retain=True)
-                        published += 1
-                    if extra5:
-                        log.info("BMS extended: %s", extra5)
-
-                # 3b) Tyre pressures/temps from TPMS (7A0) PID C00B.
-                resp_t, total_t, valid_t = wican.query_iso_tp_late_cfs(
-                    0x7A0, 0x7A8, bytes.fromhex("22C00B"))
-                if resp_t and len(valid_t) >= 30:
-                    tyres = decode_22_c0_0b_tpms(resp_t)
-                    for k, v in tyres.items():
-                        mq.publish(f"{TOPIC_PREFIX}/{k}", str(v), retain=True)
-                        published += 1
-                    if tyres:
-                        log.info("tyres: %s", tyres)
-
-                # 3c) Opportunistic odometer from cluster ECU (7C6, PID 22B003).
-                # Only published when ECU accepts the query (often only while
-                # moving). Also publishes VIN once if we haven't yet.
-                if wican.open_extended_session(0x7C6, 0x7CE):
-                    if not state.get("vin"):
-                        vin_resp, vin_total, vin_valid = wican.query_iso_tp_late_cfs(
-                            0x7C6, 0x7CE, bytes.fromhex("22F190"), timeout=2.0)
-                        if vin_resp:
-                            vin = decode_vin(vin_resp)
-                            if vin:
-                                state["vin"] = vin
-                                mq.publish(f"{TOPIC_PREFIX}/vin", vin, retain=True)
-                                log.info("VIN = %s", vin)
-                                published += 1
-                    odo_resp, odo_total, odo_valid = wican.query_iso_tp_late_cfs(
-                        0x7C6, 0x7CE, bytes.fromhex("22B002"), timeout=2.0)
-                    if odo_resp and odo_resp[0] == 0x62:
-                        odo = decode_odometer(odo_resp)
-                        if odo:
-                            for k, v in odo.items():
-                                mq.publish(f"{TOPIC_PREFIX}/{k}", str(v), retain=True)
-                                published += 1
-                            if "odometer_mi" in odo:
-                                state["last_odometer_mi"] = odo["odometer_mi"]
-                            log.info("odometer: %s", odo)
-                    elif odo_resp and odo_resp[0] == 0x7F and len(odo_resp) >= 3:
-                        log.debug("odometer NRC=0x%02X", odo_resp[2])
-
-                # 3d) Predicted range (DTE) from VMCU (7E2 -> 7EA) PID 22 0101.
-                # Byte offset for the DTE u16 is community-reported as 26-27
-                # but NOT bench-verified on this car — raw bytes are logged so we
-                # can recalibrate against the dashboard reading. Also handy: the
-                # full VMCU payload contains gear position, motor temps, etc.
-                resp_v, total_v, valid_v = wican.query_iso_tp_late_cfs(
-                    0x7E2, 0x7EA, bytes.fromhex("220101"))
-                if resp_v and len(valid_v) > 6:
-                    log.info("VMCU 0101 raw (%d/%d): %s",
-                             len(valid_v), total_v, resp_v.hex())
-                    dte_km = decode_vmcu_dte(resp_v, valid_v)
-                    if dte_km is not None:
-                        mq.publish(f"{TOPIC_PREFIX}/dte_km", str(dte_km), retain=True)
-                        mq.publish(f"{TOPIC_PREFIX}/dte_mi",
-                                   f"{dte_km * 0.621371:.0f}", retain=True)
-                        log.info("DTE = %d km (%.0f mi) [uncalibrated]",
-                                 dte_km, dte_km * 0.621371)
-                        published += 1
-
-                # 4) 12V battery voltage from WiCAN /check_status (free HTTP call).
-                v12 = get_12v_voltage()
-                if v12 is not None:
-                    mq.publish(f"{TOPIC_PREFIX}/12v_battery_v", f"{v12:.2f}", retain=True)
-                    log.info("12V battery = %.2fV", v12)
-                    published += 1
-
-                if published:
-                    now_ts = int(time.time())
-                    mq.publish(f"{TOPIC_PREFIX}/last_seen", str(now_ts), retain=True)
-                    # Journey/charge session detection — needs SoC, op_time, cumulatives.
-                    if (soc_data and resp and len(valid) > 6
-                            and "operating_time_s" in metrics
-                            and "cumulative_discharge_kwh" in metrics
-                            and "cumulative_charge_kwh" in metrics):
-                        current = {
-                            "ts": now_ts,
-                            "soc": soc,
-                            "op_time_s": metrics["operating_time_s"],
-                            "discharge_kwh": metrics["cumulative_discharge_kwh"],
-                            "charge_kwh": metrics["cumulative_charge_kwh"],
-                            "odometer_mi": state.get("last_odometer_mi"),
-                        }
-                        update_session_state(state, current, mq)
-                        save_state(state)
-
-                # Sleep remainder.
-                elapsed = time.monotonic() - t0
-                time.sleep(max(5.0, POLL_SECONDS - elapsed))
+            n = do_poll(wican, state, mq)
+            log.info("One-shot poll complete (%d values published) — sleeping until next visit", n)
         except Exception as e:
-            log.info("WiCAN unreachable (%s) — retry in %ds", e, backoff)
+            log.warning("Poll failed (%s) — will not retry until WiCAN leaves and returns", e)
+        finally:
             wican.close()
-            time.sleep(backoff)
-            backoff = min(300, backoff * 2)
+            # Always mark as polled, even on failure. Without this, any exception
+            # causes an unbounded retry storm: a new full CAN poll fires every 60s
+            # for as long as the car stays in WiFi range, keeping ECUs awake.
+            polled_this_visit = True
+
+        time.sleep(PRESENCE_CHECK_SECONDS)
 
 
 if __name__ == "__main__":
