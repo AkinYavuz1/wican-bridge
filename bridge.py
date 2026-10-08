@@ -53,6 +53,11 @@ PRESENCE_CHECK_SECONDS = int(os.environ.get("PRESENCE_CHECK_SECONDS", "60"))
 # DC-DC converter running (car on or charging) holds the 12 V at ~13.5-14.8 V; a
 # resting battery sits at ~12.4-12.9 V. Only touch the CAN bus above this.
 AWAKE_VOLTAGE = float(os.environ.get("AWAKE_VOLTAGE", "13.2"))
+# The WiCAN only wakes above its own wake voltage (~13.5 V), so it reappearing on
+# WiFi means the car ran moments ago — typically arriving home and switching off
+# before the next check. ECUs stay up for a few minutes after switch-off, so one
+# poll then still gets SoC/odometer/journey, unless the 12 V is already resting.
+ARRIVAL_MIN_VOLTAGE = float(os.environ.get("ARRIVAL_MIN_VOLTAGE", "12.9"))
 STATE_PATH = os.environ.get("STATE_PATH", "/data/state.json")
 # Charging is "in progress" if cumulative_charge_kwh moves by more than this
 # between consecutive polls. Below this we treat it as noise/regen-blip.
@@ -562,10 +567,13 @@ def update_session_state(state, current, mq, awake_since):
     # ---- Journey state machine (operating_time = READY-mode seconds) ----
     driving_now = op_delta > 0
     if driving_now and not journey["active"]:
-        # Started a new journey since last poll.
+        # Started a new journey since last poll. If that poll is from an earlier
+        # awake period (e.g. the whole drive happened out of WiFi range), date the
+        # start from the READY-mode time it accumulated instead.
+        stale_prev = prev.get("ts", current["ts"]) < awake_since
         journey.update({
             "active": True,
-            "start_ts": edge_ts,
+            "start_ts": current["ts"] - op_delta if stale_prev else edge_ts,
             "start_op_time": prev.get("op_time_s", current["op_time_s"]),
             "start_discharge": prev.get("discharge_kwh", current["discharge_kwh"]),
             "start_charge": prev.get("charge_kwh", current["charge_kwh"]),
@@ -820,10 +828,27 @@ def poll_slow(wican, state, mq):
 MAX_FAILED_POLLS = 3  # per awake period, then wait for the car to sleep and wake again
 
 
+def arrival_poll(state, mq, v12):
+    """One full poll when the WiCAN reappears but the car is already switching off,
+    then close any session it opened (no further polls follow while asleep)."""
+    log.info("WiCAN reappeared at 12V %.2fV (car just switched off?) — one arrival poll", v12)
+    wican = WiCAN(WICAN_HOST, WICAN_PORT)
+    try:
+        wican.connect()
+        n = do_poll(wican, state, mq, True, int(time.time()))
+        log.info("arrival poll complete (%d values)", n)
+    except Exception as e:
+        log.warning("Arrival poll failed (%s) — waiting for the next wake", e)
+    finally:
+        wican.close()
+    end_sessions_on_sleep(state, mq)
+
+
 def main():
     log.info("wican-bridge starting (voltage-gated: poll every %ds while 12V >= %.1fV, "
-             "slow PIDs every %ds, check every %ds)",
-             POLL_SECONDS, AWAKE_VOLTAGE, SLOW_POLL_SECONDS, PRESENCE_CHECK_SECONDS)
+             "one arrival poll on reappearing at >= %.1fV, slow PIDs every %ds, check every %ds)",
+             POLL_SECONDS, AWAKE_VOLTAGE, ARRIVAL_MIN_VOLTAGE, SLOW_POLL_SECONDS,
+             PRESENCE_CHECK_SECONDS)
     mq = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="wican-bridge",
                      protocol=mqtt.MQTTv311)
     mq.username_pw_set(MQTT_USER, MQTT_PASSWORD)
@@ -837,11 +862,15 @@ def main():
     last_poll = last_slow = 0.0  # monotonic
     failed_polls = 0
     stand_down = False  # BMS silent / repeated failures: no CAN until next awake period
+    # Assume reachable at startup so a bridge restart isn't mistaken for an arrival.
+    was_reachable = True
 
     while True:
         # HTTP only — never touches the CAN bus. None = WiCAN asleep or out of range.
         v12 = get_12v_voltage()
         awake = v12 is not None and v12 >= AWAKE_VOLTAGE
+        arrived = v12 is not None and not was_reachable
+        was_reachable = v12 is not None
         if v12 is not None:
             mq.publish(f"{TOPIC_PREFIX}/12v_battery_v", f"{v12:.2f}", retain=True)
         mq.publish(f"{TOPIC_PREFIX}/car_awake", "1" if awake else "0", retain=True)
@@ -852,6 +881,8 @@ def main():
                          f"{v12:.2f}V" if v12 is not None else "WiCAN unreachable")
                 end_sessions_on_sleep(state, mq)
                 awake_since = None
+            if arrived and v12 >= ARRIVAL_MIN_VOLTAGE:
+                arrival_poll(state, mq, v12)
             time.sleep(PRESENCE_CHECK_SECONDS)
             continue
 

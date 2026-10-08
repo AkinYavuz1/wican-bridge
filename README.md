@@ -81,6 +81,7 @@ The bridge only talks to the CAN bus while the car is demonstrably awake:
 - Every `PRESENCE_CHECK_SECONDS` (60 s) it reads the 12 V voltage from the WiCAN's `/check_status` HTTP endpoint — no CAN traffic. It publishes it as `12v_battery_v`, plus `car_awake`.
 - At or above `AWAKE_VOLTAGE` (13.2 V) the car's DC-DC converter is running (driving or charging), so the 12 V is being charged. Only then does it poll: fast PIDs (SoC, BMS, SOH) every `POLL_SECONDS` (300 s), slow ones (TPMS, odometer, range) every `SLOW_POLL_SECONDS` (1800 s).
 - Below it, nothing is sent. Any open journey/charge session is closed at the last poll.
+- **Arrival poll:** the WiCAN only wakes above its own wake voltage (~13.5 V), so when it reappears on WiFi the car ran moments ago. Usually you've just driven home and switched off before the next check. If the 12 V is still at or above `ARRIVAL_MIN_VOLTAGE` (12.9 V, i.e. not yet resting), the bridge polls once straight away, while the ECUs are still up. That captures SoC, odometer and the journey (dated from its READY-mode time) even though the drive itself happened out of WiFi range.
 - If the 12 V is high but the BMS doesn't answer the first SoC request, or 3 polls fail, it stands down until the car sleeps and wakes again. A probe can't keep re-waking a car that is settling.
 
 Charge sessions use the BMS `charging` flag, falling back to the cumulative-kWh delta if that byte is lost. With Intelligent Octopus Go-style smart charging, each charging block between pauses is its own session.
