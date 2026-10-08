@@ -6,7 +6,7 @@ No cloud. No BlueLink. No vendor app. Works on home WiFi.
 
 ## Why
 
-The BlueLink app gives you ~5 metrics on a 30-minute lag. Direct OBD gives you 30+ metrics every 15 minutes, including the ones that actually matter for battery longevity (cell spread, pack temperature delta, SOH). This bridge was built and tuned against a real 2021 Ioniq 5 (72 kWh, 48k mi).
+The BlueLink app gives you ~5 metrics on a 30-minute lag. Direct OBD gives you 30+ metrics every 5 minutes whenever the car is driving or charging, including the ones that actually matter for battery longevity (cell spread, pack temperature delta, SOH). This bridge was built and tuned against a real 2021 Ioniq 5 (72 kWh, 48k mi).
 
 ## What you need
 
@@ -55,7 +55,8 @@ docker logs -f wican-bridge
 
 You should see:
 ```
-INFO wican-bridge starting (poll every 900s)
+INFO wican-bridge starting (voltage-gated: poll every 300s while 12V >= 13.2V, slow PIDs every 1800s, check every 60s)
+INFO car awake (12V 14.31V) — polling every 300s
 INFO WiCAN slcan opened (192.168.0.12:3333)
 INFO SoC = 52.9%
 INFO cumulative metrics (34/62 bytes): {'cumulative_charge_kwh': 20486.9, ...}
@@ -70,7 +71,19 @@ INFO odometer: {'odometer_mi': 48227}
 4. Configure it to join your home WiFi.
 5. Set protocol to **slcan over TCP** on port `3333`.
 6. Set CAN bitrate to `500 kbit/s`.
-7. (Optional) Reserve a static DHCP lease for it on your router.
+7. **Enable sleep mode** (voltage threshold ~13 V). Without it the dongle's WiFi runs 24/7 and will flatten the car's 12 V battery on its own within days to weeks, no matter what this bridge does. Asleep it draws <1 mA.
+8. (Optional) Reserve a static DHCP lease for it on your router.
+
+## 12 V battery safety
+
+The bridge only talks to the CAN bus while the car is demonstrably awake:
+
+- Every `PRESENCE_CHECK_SECONDS` (60 s) it reads the 12 V voltage from the WiCAN's `/check_status` HTTP endpoint — no CAN traffic. It publishes it as `12v_battery_v`, plus `car_awake`.
+- At or above `AWAKE_VOLTAGE` (13.2 V) the car's DC-DC converter is running (driving or charging), so the 12 V is being charged. Only then does it poll: fast PIDs (SoC, BMS, SOH) every `POLL_SECONDS` (300 s), slow ones (TPMS, odometer, range) every `SLOW_POLL_SECONDS` (1800 s).
+- Below it, nothing is sent. Any open journey/charge session is closed at the last poll.
+- If the 12 V is high but the BMS doesn't answer the first SoC request, or 3 polls fail, it stands down until the car sleeps and wakes again. A probe can't keep re-waking a car that is settling.
+
+Charge sessions use the BMS `charging` flag, falling back to the cumulative-kWh delta if that byte is lost. With Intelligent Octopus Go-style smart charging, each charging block between pauses is its own session.
 
 Note: WiCAN is home-WiFi only — it doesn't have cellular. You only get data when the car is in WiFi range. That's by design and fine for daily driving + home charging telemetry.
 
@@ -97,7 +110,8 @@ If you're porting this to a non-E-GMP car, expect to recalibrate byte offsets in
 ## Caveats
 
 - **Newer cars are locking this down.** 2024+ Hyundai/Kia models may use CAN-FD with gateway-restricted PIDs. Tested on 2021 Ioniq 5.
-- **Don't expect 100% poll reliability.** ECUs sleep when the car is parked and unplugged. The bridge handles this gracefully (logs "no response" and retries).
+- **No data while the car sleeps — by design.** Parked and not charging, the 12 V sits below `AWAKE_VOLTAGE` and the bridge stays off the bus; retained MQTT values show the last poll.
+- **`AWAKE_VOLTAGE` may need tuning.** E-GMP cars vary their 12 V charging voltage; if `12v_battery_v` shows your car driving or charging below 13.2 V, lower it (but keep it above the resting ~12.9 V).
 - **No cloud, no app.** This is a self-hosting tool. If you want push notifications or remote access, pair it with Home Assistant + Tailscale.
 
 ## License

@@ -14,11 +14,20 @@ Strategy that works:
    cumulative_discharge_kWh and operating_time_s. These are slow-changing
    lifetime metrics — perfect for trip/charging analytics derived from deltas.
 
+Polling is gated on the 12 V battery voltage the WiCAN reports over HTTP
+(/check_status — no CAN traffic). At or above AWAKE_VOLTAGE the car's DC-DC
+converter is running (driving or charging), so the 12 V is being charged and
+polling can't drain it; below it the car is asleep and no CAN frames are sent.
+While awake, fast PIDs are polled every POLL_SECONDS and slow ones (TPMS,
+odometer, range) every SLOW_POLL_SECONDS. Pair with the WiCAN's own sleep mode
+(~13 V) so the dongle itself drops to <1 mA when the car is parked.
+
 Published topics (under TOPIC_PREFIX):
 - soc_pct                            — % from PID 5B
 - cumulative_charge_kwh              — lifetime kWh charged into pack
 - cumulative_discharge_kwh           — lifetime kWh discharged from pack
 - operating_time_s                   — cumulative powered-on seconds
+- 12v_battery_v / car_awake          — every presence check while WiCAN is reachable
 - online                             — retained 1/0 LWT
 """
 import json
@@ -38,7 +47,12 @@ MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 MQTT_USER = os.environ["MQTT_USER"]
 MQTT_PASSWORD = os.environ["MQTT_PASSWORD"]
 TOPIC_PREFIX = os.environ.get("TOPIC_PREFIX", "ioniq5")
-POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "900"))  # 15 min default
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "300"))  # fast PIDs, while car awake
+SLOW_POLL_SECONDS = int(os.environ.get("SLOW_POLL_SECONDS", "1800"))  # TPMS/odometer/DTE
+PRESENCE_CHECK_SECONDS = int(os.environ.get("PRESENCE_CHECK_SECONDS", "60"))
+# DC-DC converter running (car on or charging) holds the 12 V at ~13.5-14.8 V; a
+# resting battery sits at ~12.4-12.9 V. Only touch the CAN bus above this.
+AWAKE_VOLTAGE = float(os.environ.get("AWAKE_VOLTAGE", "13.2"))
 STATE_PATH = os.environ.get("STATE_PATH", "/data/state.json")
 # Charging is "in progress" if cumulative_charge_kwh moves by more than this
 # between consecutive polls. Below this we treat it as noise/regen-blip.
@@ -452,10 +466,86 @@ def save_state(state):
         log.warning("state save failed: %s", e)
 
 
-def update_session_state(state, current, mq):
+def end_journey(state, end, mq):
+    """Publish the active journey's summary, using `end` (a `current` dict) as its end."""
+    journey = state["journey"]
+    duration_s = end["op_time_s"] - journey["start_op_time"]
+    kwh_used = end["discharge_kwh"] - journey["start_discharge"]
+    kwh_regen = end["charge_kwh"] - journey["start_charge"]
+    soc_delta = end["soc"] - journey["start_soc"]
+    net_kwh = kwh_used - kwh_regen
+    duration_min = duration_s / 60.0 if duration_s > 0 else 0
+    summary = {
+        "duration_min": round(duration_min, 1),
+        "kwh_used": round(kwh_used, 2),
+        "kwh_regen": round(kwh_regen, 2),
+        "kwh_net": round(net_kwh, 2),
+        "soc_delta": round(soc_delta, 1),
+        "start_soc": journey["start_soc"],
+        "end_soc": end["soc"],
+        "start_ts": journey["start_ts"],
+        "end_ts": end["ts"],
+    }
+    start_odo = journey.get("start_odo_mi")
+    end_odo = end.get("odometer_mi")
+    if start_odo is not None and end_odo is not None and end_odo >= start_odo:
+        miles = end_odo - start_odo
+        summary["miles"] = miles
+        summary["start_odo_mi"] = start_odo
+        summary["end_odo_mi"] = end_odo
+        if net_kwh > 0:
+            summary["mi_per_kwh"] = round(miles / net_kwh, 2)
+    for k, v in summary.items():
+        mq.publish(f"{TOPIC_PREFIX}/journey/last_{k}", str(v), retain=True)
+    mq.publish(f"{TOPIC_PREFIX}/journey/in_progress", "0", retain=True)
+    log.info("journey END: %s", summary)
+    journey["active"] = False
+
+
+def end_charge(state, end, mq):
+    """Publish the active charge session's summary, using `end` as its end."""
+    charge = state["charge"]
+    kwh_added = end["charge_kwh"] - charge["start_charge"]
+    soc_added = end["soc"] - charge["start_soc"]
+    duration_s = end["ts"] - charge["start_ts"]
+    summary = {
+        "duration_min": round(duration_s / 60.0, 1),
+        "kwh_added": round(kwh_added, 2),
+        "soc_added": round(soc_added, 1),
+        "start_soc": charge["start_soc"],
+        "end_soc": end["soc"],
+        "avg_kw": round(kwh_added / (duration_s / 3600.0), 2) if duration_s > 0 else 0,
+        "start_ts": charge["start_ts"],
+        "end_ts": end["ts"],
+    }
+    for k, v in summary.items():
+        mq.publish(f"{TOPIC_PREFIX}/charge/last_{k}", str(v), retain=True)
+    mq.publish(f"{TOPIC_PREFIX}/charge/in_progress", "0", retain=True)
+    log.info("charge END: %s", summary)
+    charge["active"] = False
+
+
+def end_sessions_on_sleep(state, mq):
+    """Car went to sleep (12 V dropped / WiCAN gone): close any open session at the
+    last poll, since no further polls will happen until it wakes again."""
+    end = state.get("prev")
+    if not end:
+        return
+    if state.get("journey", {}).get("active"):
+        end_journey(state, end, mq)
+    if state.get("charge", {}).get("active"):
+        end_charge(state, end, mq)
+    save_state(state)
+
+
+def update_session_state(state, current, mq, awake_since):
     """Detect journey + charge session edges, publish summaries on transitions.
 
-    `current` keys: ts, soc, op_time_s, discharge_kwh, charge_kwh
+    `current` keys: ts, soc, op_time_s, discharge_kwh, charge_kwh, odometer_mi,
+    charging_flag (BMS B15 bit 7, or None if that byte was lost).
+    `awake_since`: unix ts this awake period began. When the previous poll is from
+    an earlier awake period, a session that started while asleep is dated from
+    the wake-up rather than from that stale poll.
     """
     prev = state.get("prev", {})
     journey = state.setdefault("journey", {"active": False})
@@ -467,6 +557,7 @@ def update_session_state(state, current, mq):
 
     op_delta = current["op_time_s"] - prev.get("op_time_s", current["op_time_s"])
     charge_delta = current["charge_kwh"] - prev.get("charge_kwh", current["charge_kwh"])
+    edge_ts = max(prev.get("ts", current["ts"]), awake_since)
 
     # ---- Journey state machine (operating_time = READY-mode seconds) ----
     driving_now = op_delta > 0
@@ -474,7 +565,7 @@ def update_session_state(state, current, mq):
         # Started a new journey since last poll.
         journey.update({
             "active": True,
-            "start_ts": prev.get("ts", current["ts"]),
+            "start_ts": edge_ts,
             "start_op_time": prev.get("op_time_s", current["op_time_s"]),
             "start_discharge": prev.get("discharge_kwh", current["discharge_kwh"]),
             "start_charge": prev.get("charge_kwh", current["charge_kwh"]),
@@ -485,68 +576,26 @@ def update_session_state(state, current, mq):
         log.info("journey START at SoC=%.1f%%", journey["start_soc"])
     elif journey["active"] and not driving_now:
         # Journey ended (no operating_time increase this cycle).
-        duration_s = current["op_time_s"] - journey["start_op_time"]
-        kwh_used = current["discharge_kwh"] - journey["start_discharge"]
-        kwh_regen = current["charge_kwh"] - journey["start_charge"]
-        soc_delta = current["soc"] - journey["start_soc"]
-        net_kwh = kwh_used - kwh_regen
-        duration_min = duration_s / 60.0 if duration_s > 0 else 0
-        summary = {
-            "duration_min": round(duration_min, 1),
-            "kwh_used": round(kwh_used, 2),
-            "kwh_regen": round(kwh_regen, 2),
-            "kwh_net": round(net_kwh, 2),
-            "soc_delta": round(soc_delta, 1),
-            "start_soc": journey["start_soc"],
-            "end_soc": current["soc"],
-            "start_ts": journey["start_ts"],
-            "end_ts": current["ts"],
-        }
-        start_odo = journey.get("start_odo_mi")
-        end_odo = current.get("odometer_mi")
-        if start_odo is not None and end_odo is not None and end_odo >= start_odo:
-            miles = end_odo - start_odo
-            summary["miles"] = miles
-            summary["start_odo_mi"] = start_odo
-            summary["end_odo_mi"] = end_odo
-            if net_kwh > 0:
-                summary["mi_per_kwh"] = round(miles / net_kwh, 2)
-        for k, v in summary.items():
-            mq.publish(f"{TOPIC_PREFIX}/journey/last_{k}", str(v), retain=True)
-        mq.publish(f"{TOPIC_PREFIX}/journey/in_progress", "0", retain=True)
-        log.info("journey END: %s", summary)
-        journey["active"] = False
+        end_journey(state, current, mq)
 
     # ---- Charge session state machine ----
-    charging_now = charge_delta > CHARGE_DELTA_THRESHOLD_KWH
+    # Prefer the BMS "charging" flag; fall back to the cumulative-kWh delta when
+    # that byte was lost (WiCAN-OBD-C3 drops leading ISO-TP frames).
+    if current.get("charging_flag") is not None:
+        charging_now = current["charging_flag"] == 1
+    else:
+        charging_now = charge_delta > CHARGE_DELTA_THRESHOLD_KWH
     if charging_now and not charge["active"]:
         charge.update({
             "active": True,
-            "start_ts": prev.get("ts", current["ts"]),
+            "start_ts": edge_ts,
             "start_charge": prev.get("charge_kwh", current["charge_kwh"]),
             "start_soc": prev.get("soc", current["soc"]),
         })
         mq.publish(f"{TOPIC_PREFIX}/charge/in_progress", "1", retain=True)
         log.info("charge START at SoC=%.1f%%", charge["start_soc"])
     elif charge["active"] and not charging_now:
-        kwh_added = current["charge_kwh"] - charge["start_charge"]
-        soc_added = current["soc"] - charge["start_soc"]
-        duration_s = current["ts"] - charge["start_ts"]
-        summary = {
-            "duration_min": round(duration_s / 60.0, 1),
-            "kwh_added": round(kwh_added, 2),
-            "soc_added": round(soc_added, 1),
-            "start_soc": charge["start_soc"],
-            "end_soc": current["soc"],
-            "avg_kw": round(kwh_added / (duration_s / 3600.0), 2) if duration_s > 0 else 0,
-            "start_ts": charge["start_ts"],
-            "end_ts": current["ts"],
-        }
-        for k, v in summary.items():
-            mq.publish(f"{TOPIC_PREFIX}/charge/last_{k}", str(v), retain=True)
-        mq.publish(f"{TOPIC_PREFIX}/charge/in_progress", "0", retain=True)
-        log.info("charge END: %s", summary)
-        charge["active"] = False
+        end_charge(state, current, mq)
 
     state["prev"] = current
 
@@ -606,27 +655,16 @@ def decode_22_01_01_partial(resp_bytes: bytes, valid_offsets: set):
     return out
 
 
-PRESENCE_CHECK_SECONDS = int(os.environ.get("PRESENCE_CHECK_SECONDS", "60"))
-
-
-def wican_reachable():
-    """Return True if WiCAN HTTP endpoint responds (lightweight presence check)."""
-    try:
-        with urllib.request.urlopen(f"http://{WICAN_HOST}/check_status", timeout=3) as r:
-            r.read()
-        return True
-    except Exception:
-        return False
-
-
-def do_poll(wican, state, mq):
-    """Run one complete set of OBD queries and publish. Called once per WiFi visit."""
+def do_poll(wican, state, mq, full, awake_since):
+    """Run one set of OBD queries and publish. Only called while the 12 V says the
+    car is awake. `full` adds the slow-changing PIDs (TPMS, odometer/VIN, DTE)."""
     published = 0
     soc_data = None
     soc = None
     resp = None
     valid = set()
     metrics = {}
+    live = {}
 
     # 1) Single-frame SoC via Mode 01 PID 5B (BMS at 7EC).
     soc_data = wican.query_single(0x7DF, 0x7EC, bytes.fromhex("015B"))
@@ -694,6 +732,38 @@ def do_poll(wican, state, mq):
         if extra5:
             log.info("BMS extended: %s", extra5)
 
+    # 3b-3d) Slow-changing values: once per SLOW_POLL_SECONDS while awake.
+    if full:
+        published += poll_slow(wican, state, mq)
+
+    # 4) Mark the poll and drive the journey/charge state machines.
+    if published:
+        now_ts = int(time.time())
+        mq.publish(f"{TOPIC_PREFIX}/last_seen", str(now_ts), retain=True)
+        if (soc is not None and resp and len(valid) > 6
+                and "operating_time_s" in metrics
+                and "cumulative_discharge_kwh" in metrics
+                and "cumulative_charge_kwh" in metrics):
+            current = {
+                "ts": now_ts,
+                "soc": soc,
+                "op_time_s": metrics["operating_time_s"],
+                "discharge_kwh": metrics["cumulative_discharge_kwh"],
+                "charge_kwh": metrics["cumulative_charge_kwh"],
+                "odometer_mi": state.get("last_odometer_mi"),
+                "charging_flag": live.get("charging"),
+            }
+            update_session_state(state, current, mq, awake_since)
+            save_state(state)
+
+    return published
+
+
+def poll_slow(wican, state, mq):
+    """TPMS, odometer/VIN and VMCU range. Only called once the BMS has already
+    answered this poll, so the bus is known to be awake."""
+    published = 0
+
     # 3b) Tyre pressures/temps from TPMS (7A0) PID C00B.
     resp_t, total_t, valid_t = wican.query_iso_tp_late_cfs(
         0x7A0, 0x7A8, bytes.fromhex("22C00B"))
@@ -706,9 +776,7 @@ def do_poll(wican, state, mq):
             log.info("tyres: %s", tyres)
 
     # 3c) Opportunistic odometer from cluster ECU (7C6, PID 22B002).
-    # Guard: only attempt if ECUs are already awake (published > 0), to avoid
-    # waking the cluster ECU with a UDS DiagnosticSessionControl when everything else is silent.
-    if published > 0 and wican.open_extended_session(0x7C6, 0x7CE):
+    if wican.open_extended_session(0x7C6, 0x7CE):
         if not state.get("vin"):
             vin_resp, vin_total, vin_valid = wican.query_iso_tp_late_cfs(
                 0x7C6, 0x7CE, bytes.fromhex("22F190"), timeout=2.0)
@@ -746,37 +814,18 @@ def do_poll(wican, state, mq):
             log.info("DTE = %d km (%.0f mi) [uncalibrated]", dte_km, dte_km * 0.621371)
             published += 1
 
-    # 4) 12V battery voltage from WiCAN /check_status (free HTTP call).
-    v12 = get_12v_voltage()
-    if v12 is not None:
-        mq.publish(f"{TOPIC_PREFIX}/12v_battery_v", f"{v12:.2f}", retain=True)
-        log.info("12V battery = %.2fV", v12)
-        published += 1
-
-    if published:
-        now_ts = int(time.time())
-        mq.publish(f"{TOPIC_PREFIX}/last_seen", str(now_ts), retain=True)
-        if (soc_data and resp and len(valid) > 6
-                and "operating_time_s" in metrics
-                and "cumulative_discharge_kwh" in metrics
-                and "cumulative_charge_kwh" in metrics):
-            current = {
-                "ts": now_ts,
-                "soc": soc,
-                "op_time_s": metrics["operating_time_s"],
-                "discharge_kwh": metrics["cumulative_discharge_kwh"],
-                "charge_kwh": metrics["cumulative_charge_kwh"],
-                "odometer_mi": state.get("last_odometer_mi"),
-            }
-            update_session_state(state, current, mq)
-            save_state(state)
-
     return published
 
 
+MAX_FAILED_POLLS = 3  # per awake period, then wait for the car to sleep and wake again
+
+
 def main():
-    log.info("wican-bridge starting (presence-triggered, check every %ds)", PRESENCE_CHECK_SECONDS)
-    mq = mqtt.Client(client_id="wican-bridge", protocol=mqtt.MQTTv311)
+    log.info("wican-bridge starting (voltage-gated: poll every %ds while 12V >= %.1fV, "
+             "slow PIDs every %ds, check every %ds)",
+             POLL_SECONDS, AWAKE_VOLTAGE, SLOW_POLL_SECONDS, PRESENCE_CHECK_SECONDS)
+    mq = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="wican-bridge",
+                     protocol=mqtt.MQTTv311)
     mq.username_pw_set(MQTT_USER, MQTT_PASSWORD)
     mq.will_set(f"{TOPIC_PREFIX}/online", "0", retain=True)
     mq.connect(MQTT_HOST, MQTT_PORT, keepalive=120)
@@ -784,40 +833,62 @@ def main():
     mq.publish(f"{TOPIC_PREFIX}/online", "1", retain=True)
 
     state = load_state()
-    # True while WiCAN is in range and we have already polled this visit.
-    # Resets to False when WiCAN leaves WiFi range.
-    polled_this_visit = False
+    awake_since = None  # unix ts the current awake period began; None while asleep
+    last_poll = last_slow = 0.0  # monotonic
+    failed_polls = 0
+    stand_down = False  # BMS silent / repeated failures: no CAN until next awake period
 
     while True:
-        present = wican_reachable()
+        # HTTP only — never touches the CAN bus. None = WiCAN asleep or out of range.
+        v12 = get_12v_voltage()
+        awake = v12 is not None and v12 >= AWAKE_VOLTAGE
+        if v12 is not None:
+            mq.publish(f"{TOPIC_PREFIX}/12v_battery_v", f"{v12:.2f}", retain=True)
+        mq.publish(f"{TOPIC_PREFIX}/car_awake", "1" if awake else "0", retain=True)
 
-        if not present:
-            if polled_this_visit:
-                log.info("WiCAN left WiFi range — will poll on next appearance")
-                polled_this_visit = False
+        if not awake:
+            if awake_since is not None:
+                log.info("car asleep (12V %s) — polling stopped",
+                         f"{v12:.2f}V" if v12 is not None else "WiCAN unreachable")
+                end_sessions_on_sleep(state, mq)
+                awake_since = None
             time.sleep(PRESENCE_CHECK_SECONDS)
             continue
 
-        if polled_this_visit:
-            # Still in range, already polled — just keep checking presence.
-            time.sleep(PRESENCE_CHECK_SECONDS)
-            continue
+        now = time.monotonic()
+        if awake_since is None:
+            awake_since = int(time.time())
+            last_poll = last_slow = now - max(POLL_SECONDS, SLOW_POLL_SECONDS)
+            failed_polls = 0
+            stand_down = False
+            log.info("car awake (12V %.2fV) — polling every %ds", v12, POLL_SECONDS)
 
-        # First detection this visit — run one full poll.
-        log.info("WiCAN appeared — running one-shot poll")
-        wican = WiCAN(WICAN_HOST, WICAN_PORT)
-        try:
-            wican.connect()
-            n = do_poll(wican, state, mq)
-            log.info("One-shot poll complete (%d values published) — sleeping until next visit", n)
-        except Exception as e:
-            log.warning("Poll failed (%s) — will not retry until WiCAN leaves and returns", e)
-        finally:
-            wican.close()
-            # Always mark as polled, even on failure. Without this, any exception
-            # causes an unbounded retry storm: a new full CAN poll fires every 60s
-            # for as long as the car stays in WiFi range, keeping ECUs awake.
-            polled_this_visit = True
+        if not stand_down and now - last_poll >= POLL_SECONDS:
+            full = now - last_slow >= SLOW_POLL_SECONDS
+            wican = WiCAN(WICAN_HOST, WICAN_PORT)
+            try:
+                wican.connect()
+                n = do_poll(wican, state, mq, full, awake_since)
+                if n == 0:
+                    # 12 V is up but the BMS didn't answer (e.g. surface charge just
+                    # after switch-off). Don't keep probing a sleeping bus.
+                    stand_down = True
+                    log.info("BMS silent despite 12V %.2fV — no more polls until the car "
+                             "sleeps and wakes again", v12)
+                else:
+                    failed_polls = 0
+                    if full:
+                        last_slow = now
+                    log.info("poll complete (%d values%s)", n, ", incl. slow PIDs" if full else "")
+            except Exception as e:
+                failed_polls += 1
+                stand_down = failed_polls >= MAX_FAILED_POLLS
+                log.warning("Poll failed (%s)%s", e,
+                            " — giving up until next awake period" if stand_down
+                            else f" — retrying in {POLL_SECONDS}s")
+            finally:
+                wican.close()
+                last_poll = now  # rate-limits retries too: never more than one poll per POLL_SECONDS
 
         time.sleep(PRESENCE_CHECK_SECONDS)
 
